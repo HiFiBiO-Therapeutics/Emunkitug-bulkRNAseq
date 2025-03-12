@@ -1,0 +1,356 @@
+---
+title: "Emunkitug Tumor bulkRNAseq"
+author: "Spencer Huggett"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+## Introduction
+
+This analysis covers the preprocessing, differential expression, PCA, gene set enrichment, and visualization of bulk RNA-seq data. The goal is to provide a reproducible workflow for analyzing the data.
+
+## Setup
+
+Load required libraries. Make sure to install any packages that are not available in your environment.
+
+```{r libraries, message=FALSE, warning=FALSE}
+# Data analysis and visualization packages
+library(DESeq2)
+library(RSQLite)
+library(data.table)
+library(biomaRt)
+library(factoextra)
+library(fgsea)
+library(ggsci)
+library(ggpubr)
+library(edgeR)
+library(BiocParallel)
+library(readxl)
+library(plyr)
+library(stringr)
+library(dplyr)
+library(ComplexHeatmap)
+library(circlize)
+library(ggfx)
+library(ggrepel)
+library(variancePartition)
+
+makeGeneRankStat <- function(statistic, names) {
+  generank <- statistic
+  names(generank) <- names
+  generank <- generank[which(!is.na(generank))]
+  generank <- generank[which(!is.nan(generank))]
+  generank <- generank[which(names(generank) != "")]
+  generank[which(generank == "-Inf")] <- min(generank[which(generank != "-Inf")], na.rm = TRUE) - 
+    (0.01 * min(generank[which(generank != "-Inf")], na.rm = TRUE))
+  generank[which(generank == "Inf")] <- max(generank[which(generank != "Inf")], na.rm = TRUE) + 
+    (0.01 * max(generank[which(generank != "Inf")], na.rm = TRUE))
+  generank <- generank[order(abs(generank), decreasing = TRUE)]
+  generank <- generank[!duplicated(names(generank))]
+  generank <- generank[order(generank, decreasing = TRUE)]
+  return(generank)
+}
+
+
+# Load gene info from biomaRt
+human <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+humBM <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol", "description"), mart = human)
+humBM$description <- gsub("\\s*\\[.*?\\]", "", humBM$description)
+
+```
+
+
+
+## Diffeerential Expression Analysis
+
+Subset data, create a DESeq2 dataset, and perform differential expression analysis.
+
+```{r libraries, message=FALSE, warning=FALSE}
+# Load metadata and raw count data
+meta <- read.csv('~/HFB2003/Data/bulkRNAseq/2025/Metadata.2.26.25.csv')
+dat <- as.data.frame(fread('~/HFB2003/Data/bulkRNAseq/2025/raw_mtx.tsv'))
+colnames(dat) <- gsub('HFB200301_', '', colnames(dat))
+
+# Extract gene IDs and clean data
+gene_id <- dat$V1
+dat <- dat[, which(colnames(dat) != 'V1')]
+meta <- subset(meta, Timepoint == 'SCR')
+dat <- dat[, which(colnames(dat) %in% meta$Sample)]
+meta <- meta[match(colnames(dat), meta$Sample),]
+rownames(dat) <- gene_id
+
+# Create DESeq2 dataset and run differential expression
+dds <- DESeqDataSetFromMatrix(dat, meta, design = ~ Condition)
+dds <- DESeq(dds)
+results_dds <- results(dds, contrast = c('Condition', 'Responder', 'Non-Responder'))
+res <- as.data.frame(results_dds)
+res$ensembl_gene_id <- rownames(res)
+res <- merge(humBM, res, by = 'ensembl_gene_id')
+
+# saveRDS(res, '~/HFB2003/Data/bulkRNAseq/2025/DEGs_PR.and.SD_vs_PD.all.scr.2.20.25.rds')
+
+# Annotate significance based on adjusted p-value and log2FoldChange thresholds
+res$significant <- ifelse(res$padj < 0.05 & res$log2FoldChange > 1, 'S', 'NS')
+res$significant <- ifelse(res$padj < 0.05 & res$log2FoldChange < -1, 'D', res$significant)
+
+ggplot(res, aes(x = log2FoldChange, y = -log10(padj))) +
+  with_shadow(
+    geom_point(aes(color = significant),
+               size = ifelse(res$significant %in% c('S', 'D'), 2.5, 0.2),
+               alpha = 0.8),
+    sigma = 5, x_offset = 3, y_offset = 3
+  ) +
+  geom_hline(yintercept = -log10(0.05), color = 'red', linetype = 'dashed', linewidth = 1.2) +
+  geom_vline(xintercept = c(-1, 1), color = 'black', linetype = 'dashed', linewidth = 1.2) +
+  scale_color_manual(values = rev(c('red', 'grey85', 'cornflowerblue'))) +
+  labs(x = expression(Log[2]~Fold~Change), y = expression(-Log[10]~P[adj]),
+       title = 'PR & SD vs PD', subtitle = 'Baseline') +
+  theme_classic(base_size = 25) +
+  theme(legend.position = 'none') +
+  ylim(0, 7.5) +
+  xlim(-7.5, 7.5)
+```
+
+
+## Gene-set Enrichment Analysis (GSEA)
+
+```{r libraries, message=FALSE, warning=FALSE}
+hfb.genes <- readRDS('~/GeneSets/HFB.Genesets.7.24.24.rds')
+
+# Define GSEA enrichment function
+GSEA.enrich <- function(x) {
+  generank <- makeGeneRankStat(x$stat, toupper(x$hgnc_symbol))
+  gsea.res <- fgseaMultilevel(pathways = hfb.genes, stats = generank,
+                              minSize = 15, maxSize = 500, eps = 0, nproc = 15)
+  return(gsea.res)
+}
+
+# Run GSEA
+res.gsea <- GSEA.enrich(res)
+# Optionally, save results
+# saveRDS(res.gsea, '~/HFB2003/Data/bulkRNAseq/6.4.24/GSEA.Responder.vs.NonResponder.DESeq2.rds')
+res.gsea.sig <- subset(res.gsea, padj < 0.05 & abs(NES) > 2)
+```
+
+
+## Indication Enrichment Analysis
+
+Using the response signature from Emunkitug Ph1 data (using DEGs & leading edge GSEA gene results) to create a gene list of interest ('Emunkitug'), then perform an enrichment analysis to determine what indications in TCGA are enriched for thhis response signature.
+
+```{r libraries, message=FALSE, warning=FALSE}
+base.degs <- readRDS('~/HFB2003/Data/bulkRNAseq/2025/DEGs_PR.and.SD_vs_PD.all.scr.2.20.25.rds')
+res.gsea <- readRDS('~/HFB2003/Data/bulkRNAseq/2025/GSEA_PR.and.SD_vs_PD.all.scr.2.20.25.rds')
+
+# Subset significant GSEA results and extract leading edge genes
+res.gsea.sig <- subset(res.gsea, padj < 0.05 & abs(NES) > 2)
+gsea.genes <- unlist(res.gsea.sig$leadingEdge)
+
+# Define gene list of interest by intersecting DEGs and GSEA leading edge genes
+deg.genes <- subset(base.degs, pvalue < 0.01 & abs(log2FoldChange) > 1)$hgnc_symbol
+genes.of.interest <- sort(intersect(deg.genes, gsea.genes))
+hfb.genes <- list(Emunkitug = genes.of.interest)
+
+# Define a TCGA enrichment function
+TCGA.enrich <- function(x) {
+  generank <- makeGeneRankStat(x$Mean.z, toupper(x$hgnc_symbol))
+  gsea.res <- fgseaMultilevel(pathways = hfb.genes, stats = generank,
+                              minSize = 15, maxSize = 500, eps = 0, nproc = 15)
+  return(gsea.res)
+}
+
+# Read TCGA enrichment results
+tcga.all <- readRDS('~/HFB2003/Data/bulkRNAseq/2025/TCGA.Emunkitug.Signature.Enrich.All.rds')
+tcga.pd1 <- readRDS('~/HFB2003/Data/bulkRNAseq/2025/TCGA.Emunkitug.Signature.Enrich.PDL1.rds')
+
+# Process TCGA PD1 data
+tcga.pd1 <- tcga.pd1[grep('PDL1', tcga.pd1$variable), ]
+tcga.pd1 <- tcga.pd1[grep(c('MESO|HNSC|CESC|LUAD'), tcga.pd1$variable), ]
+colnames(tcga.pd1)[1] <- 'Cancer'
+tcga.pd1 <- subset(tcga.pd1, pathway == 'Emunkitug')
+
+# Enrich TCGA data by Cancer
+tcga.z <- readRDS('~/TCGA/Data/TCGA.Subtype.Zstats.rds')
+tcga.all <- plyr::ddply(tcga.z, .(Cancer), GSEA.enrich)
+
+tcga.z <- readRDS('~/TCGA/Data/TCGA.Subtype.Zstats.PDL1.rds')
+tcga.pd1 <- plyr::ddply(tcga.z, .(variable), GSEA.enrich)
+
+tcga.pd1 <- tcga.pd1[grep('PDL1', tcga.pd1$variable), ]
+tcga.pd1 <- tcga.pd1[grep(c('MESO|HNSC|CESC|LUAD'), tcga.pd1$variable), ]
+colnames(tcga.pd1)[1] <- 'Cancer'
+tcga.pd1 <- subset(tcga.pd1, pathway == 'Emunkitug')
+
+# Combine TCGA enrichment results
+tcga.all <- as.data.frame(rbind(tcga.all, tcga.pd1))
+tcga.all <- tcga.all[order(tcga.all$padj), ]
+tcga.all$rank <- 1:64
+
+# Load preclinical ranking data
+tcga.pre <- read.csv('~/HFB2003/Data/Indication.Rank.Preclinical.csv')
+
+# Process TCGA data for plotting
+tcga.all <- tcga.all %>% mutate(Cancer.broad = sub("_.*", "", Cancer))
+tcga.both <- merge(tcga.pre, tcga.all, by.x = 'Cancer', by.y = 'Cancer.broad')
+
+# Remove specific unwanted samples
+pdl1.drop1 <- intersect(grep('PDL1_high', tcga.both$Cancer.specific), grep('PDL1_low', tcga.both$Cancer.y))
+pdl1.drop2 <- intersect(grep('PDL1_low', tcga.both$Cancer.specific), grep('PDL1_high', tcga.both$Cancer.y))
+stad.drop <- intersect(grep('STAD_EBV+', tcga.both$Cancer.specific, fixed = TRUE),
+                       grep(c('STAD_MSS|STAD_MSI'), tcga.both$Cancer.y))
+stad.drop2 <- which(tcga.both$Cancer.specific == 'STAD_EBV-' & tcga.both$Cancer.y == 'STAD_EBV+')
+
+tcga.plot <- tcga.both[-c(pdl1.drop1, pdl1.drop2, stad.drop, stad.drop2), ]
+tcga.plot$perc.x <- (1 - (tcga.plot$Rank - 1) / max(tcga.plot$Rank)) * 100
+tcga.plot$perc.y <- (1 - (tcga.plot$rank - 1) / max(tcga.plot$rank)) * 100
+
+ggplot(tcga.plot, aes(x = perc.x, y = perc.y)) +
+  geom_point(aes(colour = Cancer), size = 2, alpha = 0.75) +
+  geom_text_repel(aes(label = Cancer.y), size = 4,
+                  box.padding = unit(0.35, "lines"),
+                  point.padding = unit(0.5, "lines"),
+                  max.overlaps = Inf) +
+  geom_hline(yintercept = 75, linetype = 'dashed', color = 'red', linewidth = 1.5) +
+  geom_vline(xintercept = 75, linetype = 'dashed', color = 'red', linewidth = 1.5) +
+  labs(x = 'Indication Rank Preclinical (%tile)', y = 'Indication Rank Phase 1 (%tile)', color = '') +
+  theme_classic(base_size = 30) +
+  theme(legend.position = 'none', strip.text = element_text(size = 25),
+        strip.background = element_blank())
+
+
+tcga.pd1 <- readRDS('~/HFB2003/Data/bulkRNAseq/6.4.24/TCGA_GSEA_PDL1.HFB2003.pval.025.Non.Rescue.rds') 
+tcga.all <- readRDS('~/HFB2003/Data/bulkRNAseq/6.4.24/TCGA_GSEA_HFB2003.pval.025.rds') 
+
+tcga.pd1 <- tcga.pd1[grep('PDL1', tcga.pd1$variable), ]
+tcga.pd1 <- tcga.pd1[grep(c('MESO|HNSC|CESC|LUAD'), tcga.pd1$variable), ]
+colnames(tcga.pd1)[1] <- 'Cancer'
+tcga.pd1 <- subset(tcga.pd1, pathway == 'HFB2003_Tumor_RNAseq_PD_Biomarkers')
+
+tcga.all <- as.data.frame(rbind(tcga.all, tcga.pd1))
+tcga.all <- tcga.all[order(tcga.all$padj), ]
+tcga.all$rank <- 1:64
+
+tcga.pre <- read.csv('~/HFB2003/Data/Indication.Rank.Preclinical.csv')
+tcga.all <- tcga.all %>% mutate(Cancer.broad = sub("_.*", "", Cancer))
+tcga.both <- merge(tcga.pre, tcga.all, by.x = 'Cancer', by.y = 'Cancer.broad')
+
+pdl1.drop1 <- intersect(grep('PDL1_high', tcga.both$Cancer.specific), grep('PDL1_low', tcga.both$Cancer.y))
+pdl1.drop2 <- intersect(grep('PDL1_low', tcga.both$Cancer.specific), grep('PDL1_high', tcga.both$Cancer.y))
+stad.drop <- intersect(grep('STAD_EBV+', tcga.both$Cancer.specific, fixed = TRUE),
+                       grep(c('STAD_MSS|STAD_MSI'), tcga.both$Cancer.y))
+stad.drop2 <- which(tcga.both$Cancer.specific == 'STAD_EBV-' & tcga.both$Cancer.y == 'STAD_EBV+')
+
+tcga.plot <- tcga.both[-c(pdl1.drop1, pdl1.drop2, stad.drop, stad.drop2), ]
+tcga.plot$perc.x <- (1 - (tcga.plot$Rank - 1) / max(tcga.plot$Rank)) * 100
+tcga.plot$perc.y <- (1 - (tcga.plot$rank - 1) / max(tcga.plot$rank)) * 100
+
+# Scatter plot for quadrant analysis
+ggplot(tcga.plot, aes(x = perc.x, y = perc.y)) +
+  geom_point(aes(colour = Cancer), size = 2, alpha = 0.75) +
+  geom_text_repel(aes(label = Cancer.y), size = 4,
+                  box.padding = unit(0.35, "lines"),
+                  point.padding = unit(0.5, "lines"),
+                  max.overlaps = Inf) +
+  geom_hline(yintercept = 75, linetype = 'dashed', color = 'red', linewidth = 1.5) +
+  geom_vline(xintercept = 75, linetype = 'dashed', color = 'red', linewidth = 1.5) +
+  labs(x = 'Indication Rank Preclinical (%tile)', y = 'Indication Rank Ph1 A (%tile)', color = '') +
+  theme_classic(base_size = 30) +
+  theme(legend.position = 'none', strip.text = element_text(size = 25),
+        strip.background = element_blank())
+
+# Bar plot for significant results
+tcga.plot2 <- tcga.plot[-which(duplicated(tcga.plot$Cancer.y)), ]
+tcga.plot2$signif <- ifelse(tcga.plot2$padj < 0.01, 'Sig', 'NS')
+
+ggplot(tcga.plot2, aes(x = reorder(Cancer.y, -padj), y = -log10(padj), fill = signif)) +
+  geom_bar(stat = 'identity', position = position_dodge(0.9)) +
+  theme_classic(base_size = 21.5) +
+  labs(x = '', y = expression(-Log[10]~P[adj])) +
+  theme(legend.position = 'none') +
+  scale_fill_manual(values = c(Sig = "springgreen", NS = "navyblue")) +
+  geom_hline(yintercept = -log10(0.01), linetype = 'dashed', color = 'black', linewidth = 1.5) +
+  coord_flip()
+```
+
+
+
+## PD Effects
+
+This section analyzes paired biopsies to assess PD effects using the limma/voom pipeline with variance partitioning.
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(variancePartition)
+library(edgeR)
+library(BiocParallel)
+
+# Read and preprocess metadata
+meta <- read.csv('~/HFB2003/Data/bulkRNAseq/2025/metadata.csv')
+meta$Sample <- gsub('HFB200301_', '', meta$Sample)
+
+meta <- meta %>%
+  dplyr::mutate(
+    Patient = str_extract(Sample, "\\d{6}"),
+    Timepoint = case_when(
+      str_detect(Sample, "Screening|SCR") ~ "SCR",
+      str_detect(Sample, "C2D8") ~ "C2D8",
+      TRUE ~ NA_character_
+    )
+  )
+rownames(meta) <- meta$Sample
+
+# Load tracker data and merge with metadata
+tracker <- read.csv('~/HFB2003/Data/Tracker/Tracker_2.4.25.csv')
+tracker <- tracker[, c('Subject', 'Tumor', 'Sched', 'Combo', 'Dose', 'BOR',
+                        'Preceding.Tx.MoA', 'ToT.Month', 'TNFa', 'sTNFR2', 
+                        'TNFa.sTNFR2.hi', 'Prior.IO')]
+tracker$BOR <- gsub(c('Death|Clinical PD'), 'PD', tracker$BOR)
+tracker$BOR <- gsub(c('SD>18wks'), 'SD', tracker$BOR)
+tracker$BOR <- gsub(c('PD->SD'), 'SD', tracker$BOR)
+tracker$BOR <- gsub(c('SD/PR'), 'PR', tracker$BOR, fixed = TRUE)
+tracker$Condition <- ifelse(tracker$Subject %in% unique(subset(tracker, BOR %in% c('PR', 'SD'))$Subject),
+                            'Responder', 'Non-Responder')
+tracker$Patient <- gsub('-', '', tracker$Subject)
+
+meta <- merge(meta, tracker, by = 'Patient')
+
+# Load raw data again and subset paired biopsies
+dat <- as.data.frame(fread('~/HFB2003/Data/bulkRNAseq/2025/raw_mtx.tsv'))
+colnames(dat) <- gsub('HFB200301_', '', colnames(dat))
+gene_id <- dat$V1
+dat <- dat[, which(colnames(dat) != 'V1')]
+
+paired <- subset(as.data.frame(table(meta$Subject)), Freq > 1)$Var
+meta.pair <- subset(meta, Subject %in% paired)
+
+dat <- dat[, colnames(dat) %in% meta.pair$Sample]
+meta.pair <- meta.pair[match(colnames(dat), meta.pair$Sample), ]
+rownames(dat) <- gene_id
+
+# Create DESeq2 object and filter lowly expressed genes
+dds <- DESeqDataSetFromMatrix(dat, meta.pair, design = ~ Timepoint)
+isexpr <- rowSums(cpm(assay(dds)) > 1) >= 4
+dge <- dds[isexpr, ]
+dge <- calcNormFactors(dge)
+
+# Define design matrix and model formula
+design <- model.matrix(~Timepoint, meta.pair)
+form <- ~ Timepoint + (1 | Subject)
+
+# Voom transformation and linear modeling with dream
+vobjDream <- voomWithDreamWeights(dge, form, meta.pair)
+fitmm <- dream(vobjDream, form, meta.pair)
+fitmm <- eBayes(fitmm)
+
+# Extract top results and merge with gene annotations
+res.pre.post <- topTable(fitmm, coef = "TimepointSCR", number = dim(fitmm)[1])
+res.pre.post$ensembl_gene_id <- rownames(res.pre.post)
+res.pre.post <- merge(humBM, res.pre.post, by = 'ensembl_gene_id')
+```
+
+
+
+
+
+
+
+
